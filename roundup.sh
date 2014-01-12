@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # [r5]: roundup.5.html
 # [r1t]: roundup-1-test.sh.html
 # [r5t]: roundup-5-test.sh.html
@@ -60,6 +60,10 @@ do
             ;;
         --color)
             color=always
+            shift
+            ;;
+        --no-color)
+            color=never
             shift
             ;;
         -)
@@ -135,7 +139,7 @@ roundup_summarize() {
     # __Colors for output__
 
     # Use colors if we are writing to a tty device.
-    if (test -t 1) || (test $color = always)
+    if (test -t 1) || (test $color = always) && (test $color != never)
     then
         red=$(printf "\033[31m")
         grn=$(printf "\033[32m")

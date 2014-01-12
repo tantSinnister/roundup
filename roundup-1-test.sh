@@ -25,7 +25,7 @@
 # ------------
 
 # Prevent carpel tunnel
-rup() { /bin/sh $0 $1-test.sh ; }
+rup() { bash $0 $1-test.sh ; }
 
 # The Plan
 # --------
@@ -36,6 +36,7 @@ describe "roundup(1) testing roundup(5)"
 it_displays_the_title() {
     first_line=$(rup roundup-5 | head -n 1)
     test "$first_line" "=" "roundup(5)"
+    true
 }
 
 it_exits_non_zero() {
