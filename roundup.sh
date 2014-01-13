@@ -65,6 +65,7 @@ do
         --no-color)
             color=never
 	    shift
+	    ;;
         --test)
             roundup_testcase=$2
             shift 2
