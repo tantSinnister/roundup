@@ -1,5 +1,5 @@
 .POSIX:
-SHELL = /bin/sh
+SHELL = bash
 RM = rm
 CP = cp
 CD = cd
@@ -38,7 +38,7 @@ build: roundup
 	echo "or, just copy the \`$(sourcedir)/roundup' file where you need it."
 
 roundup: roundup.sh FORCE
-	$(SHELL) -n roundup.sh
+	$(BASH) -n roundup.sh
 	cp roundup.sh roundup
 	chmod 0755 roundup
 
