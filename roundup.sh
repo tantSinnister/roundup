@@ -41,7 +41,7 @@ export ROUNDUP_VERSION
 # Usage is defined in a specific comment syntax. It is `grep`ed out of this file
 # when needed (i.e. The Tomayko Method).  See
 # [shocco](http://rtomayko.heroku.com/shocco) for more detail.
-#/ usage: roundup [--help|-h] [--version|-v] [plan ...]
+#/ usage: roundup [--help|-h] [--version|-v] [--color] [--no-color] [--debug|-d] [--test TESTCASE] [plan ...]
 
 roundup_usage() {
     grep '^#/' <"$0" | cut -c4-
@@ -64,6 +64,13 @@ do
             ;;
         --no-color)
             color=never
+	    shift
+        --test)
+            roundup_testcase=$2
+            shift 2
+            ;;
+        --debug|-d)
+            debug=1
             shift
             ;;
         -)
@@ -89,24 +96,16 @@ fi
 
 # Create a temporary storage place for test output to be retrieved for display
 # after failing tests.
-roundup_tmp="$PWD/.roundup.$$"
-mkdir -p "$roundup_tmp"
-
+roundup_tmp=$(mktemp -d -t .roundup.XXX)
 trap "rm -rf \"$roundup_tmp\"" EXIT INT
 
 # __Tracing failures__
 roundup_trace() {
-    # Delete the first two lines that represent roundups execution of the
-    # test function.  They are useless to the user.
-    sed '1d'                                   |
     # Delete the last line which is the "set +x" of the error trap
     sed '$d'                                   |
     # Replace the rc=$? of the error trap with an verbose string appended
     # to the failing command trace line.
     sed '$s/.*rc=/exit code /'                 |
-    # Trim the two left most `+` signs.  They represent the depth at which
-    # roundup executed the function.  They also, are useless and confusing.
-    sed 's/^++//'                              |
     # Indent the output by 4 spaces to align under the test name in the
     # summary.
     sed 's/^/    /'                            |
@@ -144,53 +143,170 @@ roundup_summarize() {
         red=$(printf "\033[31m")
         grn=$(printf "\033[32m")
         mag=$(printf "\033[35m")
+        ylw=$(printf "\033[33m")
         clr=$(printf "\033[m")
         cols=$(tput cols)
     fi
 
     # Make these available to `roundup_trace`.
-    export red grn mag clr
+    export red grn mag clr ylw
 
     ntests=0
     passed=0
+    skipped=0
     failed=0
 
     : ${cols:=10}
 
+    prev_status=""
     while read status name
     do
+        case $status in
+        p|s|f)
+            if [ "$debug" == 1 ]; then
+                if [ "$prev_status" == l -a "$status" == f ]; then
+	            rc=$(sed 's/^.*rc=//' <<<"$second_last_trace_line")
+                    printf "\r    \`------------------------- exit code %-3s ---> %s " "$rc"
+                elif [ "$prev_status" == l -a "$status" == s ]; then
+                    printf "\r    \`-------------------------------------------> %s " ""
+	        else
+                    printf "\n    \`-------------------------------------------> %s " ""
+                fi
+            fi
+            ;;
+        esac
         case $status in
         p)
             ntests=$(expr $ntests + 1)
             passed=$(expr $passed + 1)
-            printf "  %-48s " "$name:"
             printf "$grn[PASS]$clr\n"
+            ;;
+        s)
+            ntests=$(expr $ntests + 1)
+            skipped=$(expr $skipped + 1)
+            printf "$ylw[SKIP]$clr\n"
             ;;
         f)
             ntests=$(expr $ntests + 1)
             failed=$(expr $failed + 1)
-            printf "  %-48s " "$name:"
             printf "$red[FAIL]$clr\n"
-            roundup_trace < "$roundup_tmp/$name"
+            if [ "$debug" != 1 ]; then
+                roundup_trace < "$roundup_tmp/$name"
+            fi
+            ;;
+        t)
+            printf "  %-48s " "$name:"
+            ;;
+        l)
+            printf "\n    %s" "$name"
+	    second_last_trace_line="$last_trace_line"
+	    last_trace_line="$name"
             ;;
         d)
             printf "%s\n" "$name"
             ;;
         esac
+        prev_status="$status"
     done
     # __Test Summary__
     #
     # Display the summary now that all tests are finished.
     yes = | head -n 57 | tr -d '\n'
     printf "\n"
-    printf "Tests:  %3d | " $ntests
-    printf "Passed: %3d | " $passed
-    printf "Failed: %3d"    $failed
+    printf "Tests:   %3d | " $ntests
+    printf "Passed:  %3d | " $passed
+    printf "Skipped: %3d | " $skipped
+    printf "Failed:  %3d"    $failed
     printf "\n"
 
     # Exit with an error if any tests failed
     test $failed -eq 0 || exit 2
 }
+
+run_with_tracing()
+{
+    exec 4>&1
+    {
+        {
+            # Set `-xe` before the test in the subshell.  We want the
+            # test to fail fast to allow for more accurate output of
+            # where things went wrong but not in _our_ process because a
+            # failed test should not immediately fail roundup.  Each
+            # tests trace output is saved in temporary storage.
+            set -xe
+            "$1"
+        } 1>&4 2>&4
+        local rc=$?
+        set +x
+    } &>/dev/null
+    exec 4>&-
+    return $rc
+}
+
+start_error_handling ()
+{
+    # exit subshell with return code of last failing command. This
+    # is needed to see the return code 253 on failed assumptions.
+    # But, only do this if the error handling is activated.
+    set -E
+    trap 'rc=$?; set +x; set -o | grep "errexit.*on" >/dev/null && exit $rc' ERR
+}
+
+print_result ()
+{
+    if [ "$2" == 0 ]
+    then printf "p"; eval export passed_$1=1
+    elif [ "$2" == 253 ]
+    then printf "s"
+    else printf "f"
+    fi
+
+    printf " $1\n"
+}
+
+run()
+{
+    local func="$1"
+
+    # show title
+    if [ "$debug" == 1 ]; then
+        printf "t $func\n"
+    fi
+
+    # Any number of things are possible in `$func`.
+    # Drop into an subshell to contain operations that may throw
+    # off `$func`; such as `cd`.
+    # Momentarily turn off auto-fail to give us access to the exit status
+    # in `$?` for capturing.
+    set +e
+    (
+        start_error_handling
+        run_with_tracing "$func"
+    ) | $tee "$roundup_tmp/$func" | $sed 's/^/l /' >$trace_device
+    roundup_result=${PIPESTATUS[0]}
+    set -e
+
+    # Check if `$func` was successful, otherwise emit fail signal
+    if [ "$roundup_result" != 0 -o "$debug" == 1 ]; then
+        if [ "$debug" != 1 ]; then
+             printf "t $func\n"
+        fi
+        print_result "$func" "$roundup_result"
+        if [ "$roundup_result" != 0 ]; then
+             continue
+        fi
+    fi
+}
+
+# in debug mode, print out the traces. Otherwise,
+# traces go to /dev/null
+if [ "$debug" == 1 ]; then
+    trace_device=/dev/stdout
+else
+    trace_device=/dev/null
+fi
+tee=$(which tee)
+sed=$(which sed)
 
 # Sandbox Test Runs
 # -----------------
@@ -217,10 +333,31 @@ do
             roundup_desc="$*"
         }
 
+        # Helper to express an assumption for a given testcase. Example:
+        # it_runs_fine() {
+        #   assume it_builds_fine
+        #   assume test -f foo
+        #   ./binary
+        # }
+        assume() {
+            if (echo "$1" | grep "^it_.*" >/dev/null)
+            then if [ "$(eval echo \${passed_$1})" == 1 ]
+                 then return 0
+                 else return 253
+                 fi
+            else if eval "$@"
+                 then return 0
+                 else return 253
+                 fi
+            fi
+        }
+
         # Provide default `before` and `after` functions that run only `:`, a
         # no-op. They may or may not be redefined by the test plan.
+        init() { :; }
         before() { :; }
         after() { :; }
+        cleanup() { :; }
 
         # Seek test methods and aggregate their names, forming a test plan.
         # This is done before populating the sandbox with tests to avoid odd
@@ -228,82 +365,96 @@ do
 
         # TODO:  I want to do this with sed only.  Please send a patch if you
         # know a cleaner way.
-        roundup_plan=$(
-            grep "^it_.*()" $roundup_p           |
-            sed "s/\(it_[a-zA-Z0-9_]*\).*$/\1/g"
-        )
+        if [ -n "$roundup_testcase" ]; then
+            roundup_plan="$roundup_testcase"
+        else
+            roundup_plan=$(
+                grep "^it_.*()" $roundup_p           |
+                sed "s/\(it_[a-zA-Z0-9_]*\).*$/\1/g"
+            )
+        fi
 
         # We have the test plan and are in our sandbox with [roundup(5)][r5]
         # defined.  Now we source the plan to bring its tests into scope.
         . ./$roundup_p
 
         # Output the description signal
-        printf "d %s" "$roundup_desc" | tr "\n" " "
+        printf "d %s\n" "$roundup_desc" | tr "\n" " "
         printf "\n"
+
+        # Run `init` function of the current plan. THis will be done before any of
+        # the tests in the plan are executed.
+        # If `init` wasn't redefined, then this is `:`.
+        run "init"
 
         for roundup_test_name in $roundup_plan
         do
+            echo "t $roundup_test_name"
+
             # Any number of things are possible in `before`, `after`, and the
             # test.  Drop into an subshell to contain operations that may throw
             # off roundup; such as `cd`.
+            # Momentarily turn off auto-fail to give us access to the tests
+            # exit status in `$?` for capturing.
+            set +e
             (
-                # Output `before` trace to temporary file. If `before` runs cleanly,
-                # the trace will be overwritten by the actual test case below.
-                {
-                    # redirect tracing output of `before` into file.
-                    {
-                        set -x
-                        # If `before` wasn't redefined, then this is `:`.
-                        before
-                    } &>"$roundup_tmp/$roundup_test_name"
-                    # disable tracing again. Its trace output goes to /dev/null.
-                    set +x
-                } &>/dev/null
+                # start bash error handling
+                start_error_handling
 
-                # exit subshell with return code of last failing command. This
-                # is needed to see the return code 253 on failed assumptions.
-                # But, only do this if the error handling is activated.
-                set -E
-                trap 'rc=$?; set +x; set -o | grep "errexit.*on" >/dev/null && exit $rc' ERR
+                # run after method in any case
+                trap 'rc=$?; set +x; if [ "$rc" == 0 ]; then run_with_tracing after; else set +xe; after; exit $rc; fi' EXIT
 
                 # If `before` wasn't redefined, then this is `:`.
-                before
+                run_with_tracing before
 
-                # Momentarily turn off auto-fail to give us access to the tests
-                # exit status in `$?` for capturing.
-                set +e
-                (
-                    # Set `-xe` before the test in the subshell.  We want the
-                    # test to fail fast to allow for more accurate output of
-                    # where things went wrong but not in _our_ process because a
-                    # failed test should not immediately fail roundup.  Each
-                    # tests trace output is saved in temporary storage.
-                    set -xe
-                    $roundup_test_name
-                ) >"$roundup_tmp/$roundup_test_name" 2>&1
+                # Define a helper to log stdout to the file stdout and stderr to the
+                # file stderr. This can be used like this:
+                #   capture ls asdf
+                #   grep "error" stderr
+                capture () {
+                    # resetting the output buffers before capturing. This should
+                    # guarantee that old data has been erases when running
+                    # capture multiple times during a test
+                    truncate -s 0 $roundup_tmp/{stdout,stderr,rc}
+                    {
+                         "$@" 2>&1 1>&3 | tee -- $roundup_tmp/stderr | awk "{ print \"\033[31m\"\$0\"\033[m\"; }" 1>&2
+                         return ${PIPESTATUS[0]};
+                    } 3>&1 | tee -- $roundup_tmp/stdout
+                    ret=${PIPESTATUS[0]}
+                    echo "$ret" > $roundup_tmp/rc
+                    return $ret
+                }
 
-                # We need to capture the exit status before returning the `set
-                # -e` mode.  Returning with `set -e` before we capture the exit
-                # status will result in `$?` being set with `set`'s status
-                # instead.
-                roundup_result=$?
+                # defining helper functions and resetting the output buffers
+                # before running the next test
+                stdout () { echo -n "$roundup_tmp/stdout"; }
+                stderr () { echo -n "$roundup_tmp/stderr"; }
+                rc ()     { echo -n "$roundup_tmp/rc"; }
+                truncate -s 0 $roundup_tmp/{stdout,stderr,rc}
 
-                # It's safe to return to normal operation.
-                set -e
+                # Define a negating operator which triggers the error trap of the shell. The
+                # builtin ! will not.
+                function expectfail () { ! "$@"; }
 
-                # If `after` wasn't redefined, then this runs `:`.
-                after
+                # run test
+                run_with_tracing "$roundup_test_name"
+            ) | $tee "$roundup_tmp/$roundup_test_name" | $sed 's/^/l /' >$trace_device
 
-                # This is the final step of a test.  Print its pass/fail signal
-                # and name.
-                if [ "$roundup_result" -ne 0 ]
-                then printf "f"
-                else printf "p"
-                fi
+            # copy roundup_result from subshell above
+            roundup_result=${PIPESTATUS[0]}
 
-                printf " $roundup_test_name\n"
-            )
+            # It's safe to return to normal operation.
+            set -e
+
+            # This is the final step of a test.  Print its pass/fail signal
+            # and name.
+            print_result "$roundup_test_name" "$roundup_result"
         done
+
+        # Run `cleanup` function of the current plan.
+        # This function is guaranteed to run after the last test case.
+        # If `cleanup` wasn't redefined, then this is `:`.
+        run "cleanup"
     )
 done |
 
